@@ -1,0 +1,59 @@
+# Starting Reference: http://nlp.seas.harvard.edu/2018/04/03/attention.html#greedy-decoding
+import torch.nn as nn
+import torch.optim as optim
+from datasets import *
+from Transformer import Transformer
+
+
+enc_voc_size = 10
+dec_voc_size = 10
+src_pad_idx = 0
+trg_pad_idx = 0
+trg_sos_idx = 2
+batch_size = 128
+max_len = 5
+d_model = 10
+n_heads = 2
+n_layers = 6
+ffn_hidden = 1024
+drop_prob = 0.1
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+if __name__ == "__main__":
+
+    enc_inputs, dec_inputs, dec_outputs = make_data()
+    loader = Data.DataLoader(MyDataSet(enc_inputs, dec_inputs, dec_outputs), 2, True)
+
+    model = Transformer(src_pad_idx=src_pad_idx,
+                        trg_pad_idx=trg_pad_idx,
+                        d_model=d_model,
+                        enc_voc_size=enc_voc_size,
+                        dec_voc_size=dec_voc_size,
+                        max_len=max_len,
+                        ffn_hidden=ffn_hidden,
+                        n_heads=n_heads,
+                        n_layers=n_layers,
+                        drop_prob=drop_prob
+                        )
+    criterion = nn.CrossEntropyLoss(ignore_index=0)    
+    optimizer = optim.SGD(model.parameters(), lr=1e-3, momentum=0.99)
+
+    for epoch in range(500):
+        for enc_inputs, dec_inputs, dec_outputs in loader:  # enc_inputs : [batch_size, src_len]
+                                                            # dec_inputs : [batch_size, tgt_len]
+                                                            # dec_outputs: [batch_size, tgt_len]
+
+            enc_inputs, dec_inputs, dec_outputs = enc_inputs, dec_inputs, dec_outputs
+            outputs1 = model(enc_inputs, dec_inputs)
+            outputs2 = outputs1.view(-1, outputs1.size(-1))
+                                                            # outputs: [batch_size * tgt_len, tgt_vocab_size]
+            loss = criterion(outputs2, dec_outputs.view(-1))
+            print('Epoch:', '%04d' % (epoch + 1), 'loss =', '{:.6f}'.format(loss))
+
+            #反向传播更新权重
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    torch.save(model, 'model.pth')
+    print("保存模型")

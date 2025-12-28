@@ -1,0 +1,333 @@
+# %%
+# code by Tae Hwan Jung(Jeff Jung) @graykode, Derek Miller @dmmiller612
+# Reference : https://github.com/jadore801120/attention-is-all-you-need-pytorch
+#           https://github.com/JayParks/transformer
+#https://github.com/graykode/nlp-tutorial/blob/master/5-1.Transformer/Transformer.ipynb
+
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt  # 添加这行
+from datasets import *
+
+
+
+def make_batch(sentences):
+    input_batch = [[src_vocab[n] for n in sentences[0].split()]]
+    output_batch = [[tgt_vocab[n] for n in sentences[1].split()]]
+    target_batch = [[tgt_vocab[n] for n in sentences[2].split()]]
+    return torch.LongTensor(input_batch), torch.LongTensor(output_batch), torch.LongTensor(target_batch)
+
+##4.get_attn_pad_mask 
+##PAD部分是无效的，所以需要将其mask掉，在计算softmax之前把这里设置为无穷大，softmax之后这些位置会变为0
+##有三个逻辑需要掩码：1编码层自注意力/2解码层自注意力/3交叉注意力
+def get_attn_pad_mask(seq_q, seq_k):
+
+    ##交叉注意力:这里一定是enc_inputs
+    ##也就是说如果是交叉注意力padding mask，要看这个len_k里面的pad符号，而不是len_q
+    batch_size, len_q = seq_q.size()
+    batch_size, len_k = seq_k.size()
+    ##eq(zero) is PAD token
+    
+    ##pad_attn_mask: [batch_size, 1, len_k], same data type with Q, K, V
+    pad_attn_mask = seq_k.data.eq(0).unsqueeze(1)
+    return pad_attn_mask.expand(batch_size, len_q, len_k)
+
+def get_attn_subsequent_mask(seq):
+    attn_shape = [seq.size(0), seq.size(1), seq.size(1)]
+    subsequent_mask = np.triu(np.ones(attn_shape), k=1)
+    subsequent_mask = torch.from_numpy(subsequent_mask).byte()
+    return subsequent_mask
+
+##7.ScaledDotProductAttention
+class ScaledDotProductAttention(nn.Module):
+    def __init__(self):
+        super(ScaledDotProductAttention, self).__init__()
+
+    def forward(self, Q, K, V, attn_mask):                                                                                                                                                                                                                             
+        scores = torch.matmul(Q, K.transpose(-1, -2)) / np.sqrt(d_k)   
+        scores.masked_fill_(attn_mask, -1e9)                           
+        attn = nn.Softmax(dim=-1)(scores)                               
+        context = torch.matmul(attn, V)                                 
+        return context, attn
+
+##6.MultiHeadAttention
+class MultiHeadAttention(nn.Module):
+    def __init__(self):
+        super(MultiHeadAttention, self).__init__()
+
+        ##两个d_k为了保证QK维度相同
+        self.W_Q = nn.Linear(d_model, d_k * n_heads)           
+        self.W_K = nn.Linear(d_model, d_k * n_heads)          
+        self.W_V = nn.Linear(d_model, d_v * n_heads)    
+              
+        self.linear = nn.Linear(n_heads * d_v, d_model)
+        self.layer_norm = nn.LayerNorm(d_model)           
+
+    def forward(self, Q, K, V, attn_mask):    
+                                                                
+        residual, batch_size = Q, Q.size(0)
+
+        ##先映射后分头；一定要注意是q和k分头之后维度是一致，所以这里两个都是d_k
+        q_s = self.W_Q(Q).view(batch_size, -1, n_heads, d_k).transpose(1, 2)   
+        k_s = self.W_K(K).view(batch_size, -1, n_heads, d_k).transpose(1, 2)   
+        v_s = self.W_V(V).view(batch_size, -1, n_heads, d_v).transpose(1, 2)   
+                                                                                      
+        attn_mask = attn_mask.unsqueeze(1).repeat(1, n_heads, 1, 1)                 
+                                                                                    
+        context, attn = ScaledDotProductAttention()(q_s, k_s, v_s, attn_mask)            
+                                                                                    
+        context = context.transpose(1, 2).reshape(batch_size, -1, n_heads * d_v)                    
+        output = self.linear(context)                                                  
+        return self.layer_norm(output + residual), attn
+    
+
+
+
+##3.PositionalEncoding
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)           
+        pe[:, 1::2] = torch.cos(position * div_term)     
+
+        pe = pe.unsqueeze(0).transpose(0, 1)  
+
+        self.register_buffer('pe',pe)                               
+
+    def forward(self, x):                                  
+        x = x + self.pe[:x.size(0), :]   
+        return self.dropout(x)
+
+
+
+class PoswiseFeedForwardNet(nn.Module):
+    def __init__(self):
+        super(PoswiseFeedForwardNet, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(d_model, d_ff, bias=False),
+            nn.ReLU(),
+            nn.Linear(d_ff, d_model, bias=False))
+
+    def forward(self, inputs):                                  # inputs: [batch_size, seq_len, d_model]
+        residual = inputs
+        output = self.fc(inputs)
+        return nn.LayerNorm(d_model)(output + residual)  # [batch_size, seq_len, d_model]
+
+##5.EncoderLayer:包含两个部分，多头注意力机制和前馈神经网络
+class EncoderLayer(nn.Module):
+    def __init__(self):
+        super(EncoderLayer, self).__init__()
+        self.enc_self_attn = MultiHeadAttention()                   
+        self.pos_ffn = PoswiseFeedForwardNet()                     
+    def forward(self, enc_inputs, enc_self_attn_mask):            
+        enc_outputs, attn = self.enc_self_attn(enc_inputs, enc_inputs, enc_inputs, enc_self_attn_mask)  
+        enc_outputs = self.pos_ffn(enc_outputs)                     
+        return enc_outputs, attn
+
+##2.Endcoder 部分包含三个部分：词向量embedding，位置编码，注意力层及后续前馈神经网络
+class Encoder(nn.Module):
+    def __init__(self):
+        super(Encoder, self).__init__()
+        self.src_emb = nn.Embedding(src_vocab_size, d_model)                     # 把字转换字向量
+        self.pos_emb = PositionalEncoding(d_model)                               # 加入位置信息
+        self.layers = nn.ModuleList([EncoderLayer() for _ in range(n_layers)])
+
+    def forward(self, enc_inputs):               
+        ##enc_inputs:[batch_size, src_len]
+
+        ##enc_outputs:[batch_size, src_len, d_model]                               
+        enc_outputs = self.src_emb(enc_inputs)      
+
+        ##词向量+位置编码
+        enc_outputs = self.pos_emb(enc_outputs.transpose(0, 1)).transpose(0,1)                    
+
+        ##padding mask这里两个参数都是enc_inputs
+        enc_self_attn_mask = get_attn_pad_mask(enc_inputs, enc_inputs)    
+
+        enc_self_attn_mask = torch.gt(enc_self_attn_mask, 0)                     
+                                                                                
+        enc_self_attns = []
+        for layer in self.layers:
+            enc_outputs, enc_self_attn = layer(enc_outputs, enc_self_attn_mask)                                                               
+            enc_self_attns.append(enc_self_attn)
+
+        return enc_outputs, enc_self_attns
+
+##10. DecoderLayer:包含三个部分，多头注意力机制和前馈神经网络
+class DecoderLayer(nn.Module):
+    def __init__(self):
+        super(DecoderLayer, self).__init__()
+        ##自注意力机制
+        self.dec_self_attn = MultiHeadAttention()
+        ##交叉注意力机制
+        self.dec_enc_attn = MultiHeadAttention()
+        self.pos_ffn = PoswiseFeedForwardNet()
+
+    def forward(self, dec_inputs, enc_outputs, dec_self_attn_mask, dec_enc_attn_mask):                                             
+
+        # 自注意力机制
+        dec_outputs, dec_self_attn = self.dec_self_attn(dec_inputs, dec_inputs, dec_inputs, dec_self_attn_mask)     
+                                                                                
+        # 交叉注意力机制                                                                        
+        dec_outputs, dec_enc_attn = self.dec_enc_attn(dec_outputs, enc_outputs, enc_outputs, dec_enc_attn_mask)       
+                                                                                
+        dec_outputs = self.pos_ffn(dec_outputs)                                
+        return dec_outputs, dec_self_attn, dec_enc_attn
+
+##9. Decoder 部分包含三个部分：词向量embedding，位置编码，注意力层及后续前馈神经网络
+class Decoder(nn.Module):
+    def __init__(self):
+        super(Decoder, self).__init__()
+        self.tgt_emb = nn.Embedding(tgt_vocab_size, d_model)
+        self.pos_emb = PositionalEncoding(d_model)
+        self.layers = nn.ModuleList([DecoderLayer() for _ in range(n_layers)])
+
+    def forward(self, dec_inputs, enc_inputs, enc_outputs):                                                                                                                                                                       
+        dec_outputs = self.tgt_emb(dec_inputs)                                      
+        dec_outputs = self.pos_emb(dec_outputs.transpose(0,1)).transpose(0,1)                         
+
+        ##padding mask
+        dec_self_attn_pad_mask = get_attn_pad_mask(dec_inputs, dec_inputs)         
+
+        ##subsequent mask
+        dec_self_attn_subsequence_mask = get_attn_subsequence_mask(dec_inputs)      
+
+        ##两个矩阵相加，大于0为1，不大于0的为0，为1的在之后被fill到无限小                                                                                                                                                            
+        dec_self_attn_mask = torch.gt((dec_self_attn_pad_mask + dec_self_attn_subsequence_mask), 0)          
+                                                                                                                                                                    
+        ##交叉注意力padding mask，只看enc_inputs里面哪些是pad符号                                                                     
+        dec_enc_attn_mask = get_attn_pad_mask(dec_inputs, enc_inputs)              
+        dec_enc_attn_mask = torch.gt(dec_enc_attn_mask, 0)                          
+
+        dec_self_attns, dec_enc_attns = [], []
+        for layer in self.layers:                                                                                                                                                                          
+            dec_outputs, dec_self_attn, dec_enc_attn = layer(dec_outputs, enc_outputs, dec_self_attn_mask, dec_enc_attn_mask)
+            dec_self_attns.append(dec_self_attn)
+            dec_enc_attns.append(dec_enc_attn)
+        return dec_outputs, dec_self_attns, dec_enc_attns
+
+
+def get_attn_pad_mask(seq_q, seq_k):                                
+    batch_size, len_q = seq_q.size()
+    batch_size, len_k = seq_k.size()
+    pad_attn_mask = seq_k.data.eq(0).unsqueeze(1)                  
+    return pad_attn_mask.expand(batch_size, len_q, len_k).byte()       
+
+
+def get_attn_subsequence_mask(seq):                                
+    
+    attn_shape = [seq.size(0), seq.size(1), seq.size(1)]            
+    subsequence_mask = np.triu(np.ones(attn_shape), k=1)           
+                                                                   
+    # array([[[0., 1., 1., 1., 1.],
+    #     [0., 0., 1., 1., 1.],
+    #     [0., 0., 0., 1., 1.],
+    #     [0., 0., 0., 0., 1.],
+    #     [0., 0., 0., 0., 0.]]])
+    subsequence_mask = torch.from_numpy(subsequence_mask).byte()    
+    return subsequence_mask
+
+
+##1.从整体网络结构来看，分为三部分：编码器，解码器，输出层
+class Transformer(nn.Module):
+    def __init__(self):
+        super(Transformer, self).__init__()
+        self.Encoder = Encoder()
+        self.Decoder = Decoder()
+        self.projection = nn.Linear(d_model, tgt_vocab_size, bias=False)
+
+    def forward(self, enc_inputs, dec_inputs):                          
+        ##enc_inputs:[batch_size, src_len]编码输入
+        ##dec_inputs:[batch_size, tgt_len]解码输入        
+         
+        ##enc_outputs编码端输出                                                     
+        enc_outputs, enc_self_attns = self.Encoder(enc_inputs)          
+                                                                        
+        ##dec_outputs是 decoder主要输出，用于后续linear映射：dec_self_attns类比于enc_self_attns是查看每个单词对decoder中输入的其余单词相关性
+        ##此处enc_input是为了在交叉注意力时，确定编码输出padding时使用，保证QK形状相同                                                                
+        dec_outputs, dec_self_attns, dec_enc_attns = self.Decoder(dec_inputs, enc_inputs, enc_outputs)                       
+                                                                       
+        ##dec_outputs做映射到词表大小                                                                
+        dec_logits = self.projection(dec_outputs)                       
+                                                                      
+        return dec_logits.view(-1, dec_logits.size(-1)), enc_self_attns, dec_self_attns, dec_enc_attns
+
+def showgraph(attn):
+    attn = attn[-1].squeeze(0)[0]
+    attn = attn.squeeze(0).data.numpy()
+    fig = plt.figure(figsize=(n_heads, n_heads)) # [n_heads, n_heads]
+    ax = fig.add_subplot(1, 1, 1)
+    ax.matshow(attn, cmap='viridis')
+    ax.set_xticklabels(['']+sentences[0].split(), fontdict={'fontsize': 14}, rotation=90)
+    ax.set_yticklabels(['']+sentences[2].split(), fontdict={'fontsize': 14})
+    plt.show()
+
+
+if __name__ == '__main__':
+
+    # S: Symbol that shows starting of decoding input
+    # E: Symbol that shows starting of decoding output
+    # P: Symbol that will fill in blank sequence if current batch data size is short than time steps
+
+    sentences = ['ich mochte ein bier P', 'S i want a beer', 'i want a beer E']
+
+    # Transformer Parameters
+    # Padding Should be Zero
+    src_vocab = {'P': 0, 'ich': 1, 'mochte': 2, 'ein': 3, 'bier': 4}
+    #src_vocab_size = len(src_vocab)
+    src_vocab_size = 10
+
+    tgt_vocab = {'P': 0, 'i': 1, 'want': 2, 'a': 3, 'beer': 4, 'S': 5, 'E': 6}
+    number_dict = {i: w for i, w in enumerate(tgt_vocab)}
+    #tgt_vocab_size = len(tgt_vocab)
+    tgt_vocab_size = 12
+
+    src_len = 5 # length of source
+    tgt_len = 5 # length of target
+
+    d_model = 512  # Embedding Size
+    d_ff = 2048  # FeedForward dimension
+    d_k = d_v = 64  # dimension of K(=Q), V
+    n_layers = 6  # number of Encoder of Decoder Layer
+    n_heads = 8  # number of heads in Multi-Head Attention
+
+    model = Transformer()
+
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
+    optimizer = optim.SGD(model.parameters(), lr=1e-3, momentum=0.99)
+
+    #enc_inputs, dec_inputs, dec_outputs = make_batch(sentences)
+    enc_inputs, dec_inputs, dec_outputs = make_data()
+    loader = Data.DataLoader(MyDataSet(enc_inputs, dec_inputs, dec_outputs), 2, False)
+
+
+    for epoch in range(200):
+        for enc_inputs, dec_inputs, dec_outputs in loader: 
+            optimizer.zero_grad()
+            outputs, enc_self_attns, dec_self_attns, dec_enc_attns = model(enc_inputs, dec_inputs)
+            loss = criterion(outputs, dec_outputs.contiguous().view(-1))
+            print('Epoch:', '%04d' % (epoch + 1), 'cost =', '{:.6f}'.format(loss))
+            loss.backward()
+            optimizer.step()
+
+    # Test
+    predict, _, _, _ = model(enc_inputs, dec_inputs)
+    predict = predict.data.max(1, keepdim=True)[1]
+    print(sentences[0], '->', [number_dict[n.item()] for n in predict.squeeze()])
+
+    print('first head of last state enc_self_attns')
+    showgraph(enc_self_attns)
+
+    print('first head of last state dec_self_attns')
+    showgraph(dec_self_attns)
+
+    print('first head of last state dec_enc_attns')
+    showgraph(dec_enc_attns)
